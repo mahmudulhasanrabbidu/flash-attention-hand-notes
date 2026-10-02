@@ -1,6 +1,6 @@
 # FlashAttention-2 Triton Pipeline: From First Principles
 
-A modular, production-ready, and educational implementation of **FlashAttention-2** written in **OpenAI Triton** and **PyTorch**, inspired by Umar Jamil's deep-dive course and Tri Dao's original research.
+A modular, production-ready, and educational implementation of **FlashAttention-2** written in **OpenAI Triton** and **PyTorch**, solving and extending the open exercises from [Umar Jamil's triton-flash-attention repository](https://github.com/hkproj/triton-flash-attention) and Tri Dao's original research.
 
 ---
 
@@ -8,11 +8,12 @@ A modular, production-ready, and educational implementation of **FlashAttention-
 1. [Overview & Motivation](#overview--motivation)
 2. [Directory Structure](#directory-structure)
 3. [Algorithmic Foundations](#algorithmic-foundations)
-4. [Solutions to Exercise 1 & Exercise 2](#solutions-to-exercise-1--exercise-2)
+4. [Solutions to Umar Jamil's Exercises](#solutions-to-umar-jamils-exercises)
 5. [Quick Start & Usage](#quick-start--usage)
 6. [Testing & Validation](#testing--validation)
 7. [Benchmarking & Performance](#benchmarking--performance)
 8. [Hardware & Execution Notes](#hardware--execution-notes)
+9. [References & Acknowledgments](#references--acknowledgments)
 
 ---
 
@@ -57,8 +58,8 @@ flash_attention_hand_notes/
 ### 1. The Online Softmax Rescaling Trick
 Standard 3-pass safe softmax requires knowing the global row maximum beforehand. Online softmax updates running statistics iteratively:
 
-$$m_{\text{new}} = \max(m_{\text{old}}, \max(x^{(k)})), \quad \alpha = e^{m_{\text{old}} - m_{\text{new}}}$$
-$$l_{\text{new}} = l_{\text{old}} \cdot \alpha + \sum e^{x^{(k)} - m_{\text{new}}}$$
+$$m_{\text{new}} = \max\left(m_{\text{old}},\, \max(x^{(k)})\right), \quad \alpha = \exp\left(m_{\text{old}} - m_{\text{new}}\right)$$
+$$l_{\text{new}} = l_{\text{old}} \cdot \alpha + \sum \exp\left(x^{(k)} - m_{\text{new}}\right)$$
 $$O_{\text{new}} = O_{\text{old}} \cdot \alpha + P^{(k)} V^{(k)}$$
 
 At the end of the loop, output is normalized by $O = O / l$.
@@ -71,9 +72,15 @@ This reduces the softmax derivative to an element-wise scale and subtraction, av
 
 ---
 
-## Solutions to Exercise 1 & Exercise 2
+## Solutions to Umar Jamil's Exercises
 
-### Exercise 1: Autotuning the Backward Pass
+This pipeline directly solves, implements, and benchmarks the two open exercises from [Umar Jamil's triton-flash-attention](https://github.com/hkproj/triton-flash-attention):
+
+### Exercise 1: Autotuning the Backwards Pass
+
+> *“Can you apply autotuning configs to the backwards pass like done for the forward pass?”*  
+> — [Umar Jamil (hkproj/triton-flash-attention)](https://github.com/hkproj/triton-flash-attention)
+
 In [`bwd_preprocess.py`](bwd_preprocess.py) and [`bwd_kernel.py`](bwd_kernel.py), kernels are decorated with `@triton.autotune`:
 - **`_attn_bwd_preprocess`**: Autotuned over `BLOCK_SIZE_Q` $\in [32, 64, 128]$ and `num_warps` $\in [2, 4, 8]$.
 - **`_attn_bwd_dk_dv`**: Autotuned over `(BLOCK_Q, BLOCK_KV)`, `num_warps`, and `num_stages` (supporting asynchronous software pipelining with `num_stages=4`).
@@ -84,16 +91,44 @@ In [`bwd_preprocess.py`](bwd_preprocess.py) and [`bwd_kernel.py`](bwd_kernel.py)
   grid_dq = lambda args: (triton.cdiv(seq_len, args["BLOCK_Q"]), 1, batch_size * num_heads)
   ```
 
-### Exercise 2: Causal Skipping (Cutting 50% of Backward FLOPs)
+---
+
+### Exercise 2: How to Make Flash Attention Faster (Causal Skipping)
+
+> *“As you can see, during the backwards pass we are going through the entire `SEQ_LEN` even when the attention calculation is `causal`, can you avoid going through all tokens that would not contribute to any change in `dK`, `dQ` and `dV` when the attention calculation is causal?”*  
+> — [Umar Jamil (hkproj/triton-flash-attention)](https://github.com/hkproj/triton-flash-attention)
+
 In causal attention, $P_{ij} = 0$ for all $j > i$.
-1. **Early Exit in `_attn_bwd_dq`**: Query tile $i \in [\text{start\_q}, \text{start\_q} + \text{BLOCK\_Q} - 1]$ only interacts with keys $j \le i$. The loop terminates early at `hi_total = (start_q + BLOCK_Q + BLOCK_KV - 1) // BLOCK_KV * BLOCK_KV`, skipping the upper-triangular dead space.
-2. **Late Start in `_attn_bwd_dk_dv`**: Key tile $j \in [\text{start\_kv}, \text{start\_kv} + \text{BLOCK\_KV} - 1]$ only interacts with queries $i \ge j$. Query blocks where $i < \text{start\_kv}$ evaluate to zero and are skipped by starting directly at `lo_q = (start_kv // BLOCK_Q) * BLOCK_Q`.
+
+1. **Early Exit in `_attn_bwd_dq`**:
+   - A query tile covering row indices from `start_q` to `start_q + BLOCK_Q - 1` ($i \in [q_{\text{start}},\, q_{\text{start}} + B_Q - 1]$) only interacts with keys where $j \le i$.
+   - Any key tile where keys are in the causal future ($j > i$) will evaluate to zero ($P_{ij} = 0$).
+   - The loop terminates early at:
+     ```python
+     hi_total = (start_q + BLOCK_Q + BLOCK_KV - 1) // BLOCK_KV * BLOCK_KV
+     ```
+     skipping the entire upper-triangular dead space.
+
+2. **Late Start in `_attn_bwd_dk_dv`**:
+   - A key tile covering column indices from `start_kv` to `start_kv + BLOCK_KV - 1` ($j \in [k_{\text{start}},\, k_{\text{start}} + B_{KV} - 1]$) only interacts with queries where $i \ge j$.
+   - Any query tile where queries precede the key ($i < j$) will evaluate to zero ($P_{ij} = 0$).
+   - The loop skips all leading zero-product iterations and starts directly at:
+     ```python
+     lo_q = (start_kv // BLOCK_Q) * BLOCK_Q
+     ```
+
+**Result**: Applying early exit and late start **halves the backward FLOP count** (50% reduction in compute) for causal attention.
+
+---
 
 ### Bonus Optimizations
-- **Two-Stage Causal Splitting**: Active blocks are divided into:
-  - *Full Tiles* (strictly below diagonal): Executed with **zero `tl.where` masking overhead**.
-  - *Boundary Transition Tile*: Only the single tile intersecting the diagonal applies `tl.where(mask, P, 0.0)`.
-- **Factored Epilogue Scaling**: Factored `softmax_scale` out of inner loops and applied once to registers right before `tl.store`.
+
+1. **Two-Stage Causal Splitting (Zero-Masking on Full Tiles)**:
+   Instead of applying `tl.where(mask, P, 0.0)` to every single active block:
+   - *Full Tiles* (strictly below diagonal): Executed with **zero masking overhead**, bypassing mask calculation entirely.
+   - *Boundary Transition Tile*: Only the single tile where the diagonal actually passes through applies `tl.where`.
+2. **Factored Epilogue Scaling**:
+   Factored `softmax_scale` out of the inner loops of `_attn_bwd_dq` and `_attn_bwd_dk_dv`, applying it once in registers right before `tl.store`.
 
 ---
 
@@ -172,3 +207,11 @@ $$\text{TFLOPs/s} = \frac{2 \times B \times H \times N^2 \times D}{\text{runtime
   2. Set **Runtime** $\rightarrow$ **Change runtime type** $\rightarrow$ **T4 GPU**.
   3. Install Triton: `!pip install triton torch`.
   4. Open [`pipeline_walkthrough.ipynb`](pipeline_walkthrough.ipynb) and run all cells interactively.
+
+---
+
+## References & Acknowledgments
+
+- **Umar Jamil**: [triton-flash-attention GitHub Repository](https://github.com/hkproj/triton-flash-attention) and YouTube lecture series *"Flash Attention from first principles"*.
+- **Tri Dao et al.**: [FlashAttention-2: Faster Attention with Better Parallelism and Work Partitioning](https://arxiv.org/abs/2307.08691) (2023).
+- **OpenAI Triton**: [Fused Attention Tutorial](https://triton-lang.org/main/getting-started/tutorials/06-fused-attention.html).
